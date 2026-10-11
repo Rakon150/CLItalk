@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { render, Box, Text, Spacer, useInput, useApp } from "ink";
+import { render, Box, Text, Spacer, useInput, useApp, useStdout } from "ink";
 import TextInput from "ink-text-input";
 import WebSocket from "ws";
 
@@ -13,7 +13,13 @@ const Chat = () => {
 	const [nameError, setNameError] = useState("");
 	const [mutedUntil, setMutedUntil] = useState(0);
 	const [cmdIndex, setCmdIndex] = useState(0);
-	const {exit} = useApp();
+	const [typingUsers, setTypingUsers] = useState({});
+	const { exit } = useApp();
+	const { stdout } = useStdout();
+	const typingTimer = useRef(null);
+	const columns = stdout?.columns || process.stdout.columns || 80;
+	const termRows = stdout?.rows || process.stdout.rows || 30;
+	const compact = columns < 50 || termRows < 12;
 	const pending = useRef(new Map());
 	const muted = Date.now() < mutedUntil;
 	const commands = [
@@ -63,6 +69,11 @@ const Chat = () => {
 				}
 
 				if (data.type === "pong") return;
+
+				if (data.type === "typing") {
+					setTypingUsers(prev => ({ ...prev, [data.name]: data.typing ? Date.now() : 0 }));
+					return;
+				}
 
 				if (data.type === "online") {
 					if (data.cid && pending.current.has(data.cid)) {
@@ -170,7 +181,7 @@ const Chat = () => {
 				if (pending.current.has(cid)) {
 					pending.current.delete(cid);
 					setStatus("reconnecting");
-					try { socket.close(); } catch {}
+					try { socket.close(); } catch { }
 				}
 			}, 5000);
 			pending.current.set(cid, timer);
@@ -205,25 +216,37 @@ const Chat = () => {
 		}
 	};
 
+	const maxMsgs = Math.max(1, termRows - (compact ? 6 : 10) - (matches.length ? matches.length + 2 : 0));
+	const visible = messages.slice(-maxMsgs);
+
 	return (
-		<Box flexDirection="column" height={process.stdout.rows || 30}>
-			<Box flexGrow={1} flexDirection="column" justifyContent="flex-end" overflow="hidden" paddingX={1} paddingTop={1}>
+		<Box flexDirection="column" height={termRows} width={columns} flexShrink={0}>
+			<Box flexGrow={1} flexDirection="column" justifyContent="flex-end" overflow="hidden" paddingX={compact ? 0 : 1} paddingTop={compact ? 0 : 1}>
 				<Text dimColor>Name: [{name}]</Text>
-				{messages.map((m) => (
-					<Box key={`${m.ts}-${m.id}-${m.text}`}>
+				{messages.length === 0 && <Text dimColor>no messages yet, be the first</Text>}
+				{visible.map((m) => (
+					<Box key={`${m.ts}-${m.id}-${m.text}`} flexShrink={0}>
 						<Text wrap="truncate-end">
 							<Text color={m.name === name ? "green" : "cyan"} bold={m.name === name}>[{m.name}] </Text>
 							<Text>{m.text}</Text>
 						</Text>
-						<Spacer />
-						<Text dimColor>{new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</Text>
+						{!compact && (
+							<>
+								<Spacer />
+								<Text dimColor shrink={0}>{new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</Text>
+							</>
+						)}
 					</Box>
 				))}
 			</Box>
 
+			{Object.entries(typingUsers).filter(([n, t]) => Date.now() - t < 3500 && n !== name).map(([n]) => (
+				<Text key={n} dimColor>{n} is typing...</Text>
+			))}
+
 			{matches.length > 0 && (
-				<Box flexDirection="column" borderStyle="round" paddingX={1} marginRight={1}>
-					{matches.map((c, i) => (
+				<Box flexDirection="column" flexShrink={0} borderStyle="round" paddingX={compact ? 0 : 1} marginRight={compact ? 0 : 1}>
+					{(compact ? matches.slice(0, 2) : matches).map((c, i) => (
 						<Box key={c.name}>
 							<Text color={i === cmdIndex ? "black" : "cyan"} backgroundColor={i === cmdIndex ? "cyan" : undefined}>
 								{i === cmdIndex ? "> " : "  "}{c.name}
@@ -233,7 +256,7 @@ const Chat = () => {
 				</Box>
 			)}
 
-			<Box borderStyle="round" borderColor={Date.now() < mutedUntil ? "red" : status === "online" ? "green" : "yellow"} paddingX={1}>
+			<Box flexShrink={0} borderStyle="round" borderColor={Date.now() < mutedUntil ? "red" : status === "online" ? "green" : "yellow"} paddingX={compact ? 0 : 1}>
 				{Date.now() < mutedUntil ? (
 					<>
 						<Text color="red">muted for spamming</Text>
@@ -243,10 +266,26 @@ const Chat = () => {
 					</>
 				) : (
 					<>
-						<Text color="green">{"> "}</Text>
-						<TextInput value={input} onChange={(v) => { setInput(v); setCmdIndex(0); }} onSubmit={submit} focus={true} />
-						<Spacer />
-						<Text dimColor>{name} - {status}</Text>
+						<Text color="green" shrink={0}>{"> "}</Text>
+						<Box flexGrow={1} flexShrink={1}>
+							<TextInput value={input} onChange={(v) => {
+								setInput(v);
+								setCmdIndex(0);
+								if (socket?.readyState === 1 && Date.now() >= mutedUntil) {
+									socket.send(JSON.stringify({ typing: v.length > 0 }));
+									clearTimeout(typingTimer.current);
+									if (v.length > 0) {
+										typingTimer.current = setTimeout(() => socket.send(JSON.stringify({ typing: false })), 3000);
+									}
+								}
+							}} onSubmit={submit} focus={true} />
+						</Box>
+						{!compact && (
+							<>
+								<Spacer />
+								<Text dimColor shrink={0}>{name} - {status}</Text>
+							</>
+						)}
 					</>
 				)
 				}
