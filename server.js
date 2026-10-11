@@ -44,6 +44,12 @@ wss.on("connection", (ws) => {
                 return;
             }
 
+            if (data.text === "/online") {
+                const names = [...wss.clients].map(c => c.name || String(c.id)).filter(Boolean);
+                ws.send(JSON.stringify({ type: "online", count: names.length, names, cid: data.cid || null }));
+                return;
+            }
+
             if (!data.text || typeof data.text !== "string") return;
 
             const now = Date.now();
@@ -65,7 +71,8 @@ wss.on("connection", (ws) => {
                 id: ws.id,
                 name: ws.name || String(ws.id),
                 text,
-                ts: now
+                ts: now,
+                cid: data.cid || null
             };
             history.push(msg);
             if (history.length > 15) history.shift();

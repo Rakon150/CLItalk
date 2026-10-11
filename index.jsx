@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from "react";
-import { render, Box, Text, Spacer } from "ink";
+import React, { useState, useEffect, useRef } from "react";
+import { render, Box, Text, Spacer, useInput, useApp } from "ink";
 import TextInput from "ink-text-input";
 import WebSocket from "ws";
 
@@ -12,6 +12,20 @@ const Chat = () => {
 	const [status, setStatus] = useState("connecting");
 	const [nameError, setNameError] = useState("");
 	const [mutedUntil, setMutedUntil] = useState(0);
+	const [cmdIndex, setCmdIndex] = useState(0);
+	const {exit} = useApp();
+	const pending = useRef(new Map());
+	const muted = Date.now() < mutedUntil;
+	const commands = [
+		{ name: "/clear", desc: "clear messages" },
+		{ name: "/online", desc: "show whos online" },
+		{ name: "/quit", desc: "leave" },
+		{ name: "/nick", desc: "change name" },
+	];
+	const cmdStem = input.split(" ")[0];
+	const matches = !muted && input.startsWith("/")
+		? commands.filter(c => c.name.startsWith(cmdStem)).slice(0, 3)
+		: [];
 
 	useEffect(() => {
 		if (!name) return;
@@ -43,8 +57,21 @@ const Chat = () => {
 				lastPong = Date.now();
 
 				const data = JSON.parse(e.data);
+				if (data.type === "msg" && data.cid && pending.current.has(data.cid)) {
+					clearTimeout(pending.current.get(data.cid));
+					pending.current.delete(data.cid);
+				}
 
 				if (data.type === "pong") return;
+
+				if (data.type === "online") {
+					if (data.cid && pending.current.has(data.cid)) {
+						clearTimeout(pending.current.get(data.cid));
+						pending.current.delete(data.cid);
+					}
+					setMessages(prev => [...prev.slice(-15), { ts: Date.now(), id: 0, name: "server", text: `online (${data.count}): ${data.names.join(", ")}` }]);
+					return;
+				}
 
 				if (data.type === "muted") {
 					setInput("");
@@ -94,6 +121,16 @@ const Chat = () => {
 		return () => { closed = true; clearInterval(pingTimer); clearInterval(checkTimer); if (ws) ws.close(); };
 	}, [name]);
 
+	useInput((_, key) => {
+		if (!matches.length) return;
+		if (key.upArrow) setCmdIndex(i => (i - 1 + matches.length) % matches.length);
+		else if (key.downArrow) setCmdIndex(i => (i + 1) % matches.length);
+		else if (key.tab) {
+			const pick = matches[cmdIndex];
+			if (pick) setInput(pick.name === "/nick" ? "/nick " : pick.name)
+		}
+	}, { isActive: !!name && !muted });
+
 	if (!name) {
 		return (
 			<Box flexDirection="column">
@@ -118,15 +155,51 @@ const Chat = () => {
 	}
 
 	const submit = (text) => {
-		if (!text.trim()) return;
+		const t = text.trim();
+		if (!t) return;
 		if (Date.now() < mutedUntil) return;
+
+		if (t === "/clear") { setMessages([]); setInput(""); return; }
+		if (t === "/quit") { exit(); return; }
+		if (t === "/online") {
+			if (!socket || socket.readyState !== 1) return;
+			const cid = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			socket.send(JSON.stringify({ text: t, cid }));
+			setInput("");
+			const timer = setTimeout(() => {
+				if (pending.current.has(cid)) {
+					pending.current.delete(cid);
+					setStatus("reconnecting");
+					try { socket.close(); } catch {}
+				}
+			}, 5000);
+			pending.current.set(cid, timer);
+			return;
+		}
+		if (t.startsWith("/nick ")) {
+			const n = t.slice(6).trim();
+			if (!/^[a-zA-Z0-9_-]{1,20}$/.test(n)) { setMessages(prev => [...prev.slice(-15), { ts: Date.now(), id: 0, name: "server", text: "bad name" }]); }
+			else { setName(n); setNameInput(n); }
+			setInput("");
+			return;
+		}
+
 		if (!socket || socket.readyState !== 1) {
 			setStatus("reconnecting");
 			return;
 		}
 		try {
-			socket.send(JSON.stringify({ text }));
+			const cid = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			socket.send(JSON.stringify({ text, cid }));
 			setInput("");
+			const t = setTimeout(() => {
+				if (pending.current.has(cid)) {
+					pending.current.delete(cid);
+					setStatus("reconnecting");
+					try { socket.close(); } catch { }
+				}
+			}, 5000);
+			pending.current.set(cid, t);
 		} catch {
 			setStatus("reconnecting");
 		}
@@ -137,27 +210,47 @@ const Chat = () => {
 			<Box flexGrow={1} flexDirection="column" justifyContent="flex-end" overflow="hidden" paddingX={1} paddingTop={1}>
 				<Text dimColor>Name: [{name}]</Text>
 				{messages.map((m) => (
-					<Text key={`${m.ts}-${m.id}-${m.text}`} wrap="truncate-end">
-						<Text color={m.name === name ? "green":"cyan"} bold={m.name === name}>[{m.name}] </Text>
-						<Text>{m.text}</Text>
-					</Text>
+					<Box key={`${m.ts}-${m.id}-${m.text}`}>
+						<Text wrap="truncate-end">
+							<Text color={m.name === name ? "green" : "cyan"} bold={m.name === name}>[{m.name}] </Text>
+							<Text>{m.text}</Text>
+						</Text>
+						<Spacer />
+						<Text dimColor>{new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</Text>
+					</Box>
 				))}
 			</Box>
-			{Date.now() < mutedUntil ? (
-				<Box borderStyle="round" borderColor="red" paddingX={1}>
-					<Text color="red">muted for spamming</Text>
-					<Spacer />
-					<Text dimColor>{name} - muted</Text>
+
+			{matches.length > 0 && (
+				<Box flexDirection="column" borderStyle="round" paddingX={1} marginRight={1}>
+					{matches.map((c, i) => (
+						<Box key={c.name}>
+							<Text color={i === cmdIndex ? "black" : "cyan"} backgroundColor={i === cmdIndex ? "cyan" : undefined}>
+								{i === cmdIndex ? "> " : "  "}{c.name}
+							</Text>
+						</Box>
+					))}
 				</Box>
-			) : (
-				<Box borderStyle="round" borderColor={status === "online" ? "green" : "yellow"} paddingX={1}>
-					<Text color="green">{"> "}</Text>
-					<TextInput value={input} onChange={setInput} onSubmit={submit} />
-					<Spacer />
-					<Text dimColor>{name} - {status}</Text>
-				</Box>
-			)
-			}
+			)}
+
+			<Box borderStyle="round" borderColor={Date.now() < mutedUntil ? "red" : status === "online" ? "green" : "yellow"} paddingX={1}>
+				{Date.now() < mutedUntil ? (
+					<>
+						<Text color="red">muted for spamming</Text>
+						<Spacer />
+						<Text dimColor>{name} - muted</Text>
+						<TextInput value="" onChange={() => { }} onSubmit={() => { }} focus={false} showCursor={false} />
+					</>
+				) : (
+					<>
+						<Text color="green">{"> "}</Text>
+						<TextInput value={input} onChange={(v) => { setInput(v); setCmdIndex(0); }} onSubmit={submit} focus={true} />
+						<Spacer />
+						<Text dimColor>{name} - {status}</Text>
+					</>
+				)
+				}
+			</Box>
 		</Box>
 	);
 };
